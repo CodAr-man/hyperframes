@@ -18,6 +18,21 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 
+// ── Auto-load .env from the project directory (cwd) ─────────────────────────
+// Mirrors what the official docs show: `echo "GEMINI_API_KEY=..." > .env`
+// Uses Node's built-in loadEnvFile (Node 20.12+) — no dotenv dependency needed.
+(() => {
+  const envPath = join(process.cwd(), ".env");
+  if (existsSync(envPath)) {
+    try {
+      // process.loadEnvFile is available in Node 20.12+ (project requires Node 22)
+      (process as any).loadEnvFile(envPath);
+    } catch {
+      // Silently ignore if the API is unavailable in older Node builds
+    }
+  }
+})();
+
 (() => {
   const here = dirname(fileURLToPath(import.meta.url));
   const shader = join(here, "shaderTransitionWorker.js");

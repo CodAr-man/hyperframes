@@ -166,27 +166,28 @@ export async function captionImagesWithGemini(
   warnings: string[],
 ): Promise<Record<string, string>> {
   const geminiCaptions: Record<string, string> = {};
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!geminiKey) return geminiCaptions;
+  if (!openRouterKey && !geminiKey) return geminiCaptions;
 
-  progress("design", "Captioning images with Gemini vision...");
+  const useOpenRouter = !!openRouterKey;
+  progress("design", `Captioning images with ${useOpenRouter ? 'OpenRouter' : 'Gemini'} vision...`);
   try {
-    const { GoogleGenAI } = await import("@google/genai");
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    let ai: any;
+    if (!useOpenRouter) {
+      const { GoogleGenAI } = await import("@google/genai");
+      ai = new GoogleGenAI({ apiKey: geminiKey });
+    }
+    
     const imageFiles = readdirSync(join(outputDir, "assets")).filter((f: string) =>
       /\.(png|jpg|jpeg|webp|gif)$/i.test(f),
     );
 
-    // Caption in parallel batches via Gemini vision API.
-    // Free tier: 5 RPM → batch 5, 12s pause (~$0 but slow)
-    // Paid tier: 2000 RPM → batch 20, 1s pause (~$0.001/image, fast)
-    // We try a larger batch first; if rate-limited, fall back to smaller batches.
-    // Default is a preview model — update when GA ships.
-    // Benchmark (49 images, paid tier): 3.1-flash-lite-preview ~507ms/img 131ch avg,
-    // 2.5-flash-lite ~230ms/img 117ch avg. Preview has richer captions but higher variance.
-    // Override: HYPERFRAMES_GEMINI_MODEL=gemini-2.5-flash-lite
-    const model = process.env.HYPERFRAMES_GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
+    const model = useOpenRouter 
+      ? (process.env.HYPERFRAMES_GEMINI_MODEL || "google/gemma-4-26b-a4b-it")
+      : (process.env.HYPERFRAMES_GEMINI_MODEL || "gemini-3.1-flash-lite-preview");
     const BATCH_SIZE = 20;
+    
     for (let i = 0; i < imageFiles.length; i += BATCH_SIZE) {
       const batch = imageFiles.slice(i, i + BATCH_SIZE);
       const results = await Promise.allSettled(
@@ -198,41 +199,71 @@ export async function captionImagesWithGemini(
           const base64 = buffer.toString("base64");
           const ext = file.split(".").pop()?.toLowerCase() || "png";
           const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
-          const response = await ai.models.generateContent({
-            model,
-            contents: [
-              {
-                role: "user",
-                parts: [
-                  { inlineData: { mimeType, data: base64 } },
-                  {
-                    text: "Describe this website image in ONE short sentence for a video storyboard. Focus on: what it shows, dominant colors, whether background is light or dark. Be factual, not creative.",
-                  },
-                ],
+          
+          let caption = "";
+          if (useOpenRouter) {
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${openRouterKey}`,
+                "Content-Type": "application/json"
               },
-            ],
-            config: { maxOutputTokens: 500 },
-          });
-          return { file, caption: response.text?.trim() || "" };
+              body: JSON.stringify({
+                model: model,
+                messages: [
+                  {
+                    role: "user",
+                    content: [
+                      { type: "text", text: "Describe this website image in ONE short sentence for a video storyboard. Focus on: what it shows, dominant colors, whether background is light or dark. Be factual, not creative." },
+                      { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } }
+                    ]
+                  }
+                ],
+                max_tokens: 500
+              })
+            });
+            const data = await response.json();
+            caption = data.choices?.[0]?.message?.content?.trim() || "";
+          } else {
+            const response = await ai.models.generateContent({
+              model,
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    { inlineData: { mimeType, data: base64 } },
+                    {
+                      text: "Describe this website image in ONE short sentence for a video storyboard. Focus on: what it shows, dominant colors, whether background is light or dark. Be factual, not creative.",
+                    },
+                  ],
+                },
+              ],
+              config: { maxOutputTokens: 500 },
+            });
+            caption = response.text?.trim() || "";
+          }
+          return { file, caption };
         }),
       );
+      
       for (const result of results) {
         if (result.status === "fulfilled" && result.value.caption) {
           geminiCaptions[result.value.file] = result.value.caption;
         }
       }
-      // Pace requests between batches (paid tier: 2000+ RPM, free tier: rate-limited)
+      
+      // Pace requests between batches
       if (i + BATCH_SIZE < imageFiles.length) {
-        await new Promise((r) => setTimeout(r, 2000)); // 2s pause between batches — paid tier handles 2000 RPM, free tier retries via Promise.allSettled
+        await new Promise((r) => setTimeout(r, 2000));
       }
       progress(
         "design",
         `Captioned ${Math.min(i + BATCH_SIZE, imageFiles.length)}/${imageFiles.length} images...`,
       );
     }
-    progress("design", `${Object.keys(geminiCaptions).length} images captioned with Gemini`);
+    progress("design", `${Object.keys(geminiCaptions).length} images captioned with ${useOpenRouter ? 'OpenRouter' : 'Gemini'}`);
   } catch (err) {
-    warnings.push(`Gemini captioning failed: ${err}`);
+    warnings.push(`Image captioning failed: ${err}`);
   }
 
   return geminiCaptions;
